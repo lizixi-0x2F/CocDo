@@ -81,6 +81,8 @@ class App:
 
 # ── Built-in constants ─────────────────────────────────────────────────────────
 
-# Binary addition: App(App(Add, a), b) represents a + b
+# Binary addition:       App(App(Add, a), b)  →  a + b
+# Scalar multiplication: App(App(Mul, w), x)  →  w * x
 # Used to combine weighted parent contributions in multi-parent mechanisms.
 Add = Const("Add")
+Mul = Const("Mul")

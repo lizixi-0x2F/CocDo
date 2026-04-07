@@ -3,6 +3,46 @@ from __future__ import annotations
 from .terms import Term, Var, Const, Sort, Pi, Lam, App
 
 
+# ── Tensor-aware built-in evaluation ──────────────────────────────────────────
+
+def _try_eval_builtin(term: App) -> Term:
+    """Evaluate App(App(Add/Mul, a), b) when a and b are Const with values.
+
+    This is the tensor-aware extension: when both operands carry numeric or
+    array-like values, we reduce the application immediately to a new Const
+    instead of leaving it as an unevaluated App.  This means the entire causal
+    propagation E_j = Σ w_i * E_i can happen inside the COC kernel via
+    beta_reduce, rather than in a separate numpy matmul.
+
+    Supported patterns:
+        App(App(Add, Const(_, a)), Const(_, b))  →  Const("_add", a + b)
+        App(App(Mul, Const(_, w)), Const(_, x))  →  Const("_mul", w * x)
+
+    Any other App is left unchanged (returned as-is).
+    """
+    # Pattern: App(partial, rhs) where partial = App(op, lhs)
+    if not isinstance(term.func, App):
+        return term
+    partial = term.func          # App(op, lhs)
+    op      = partial.func       # Add or Mul constant
+    lhs     = partial.arg        # first operand
+    rhs     = term.arg           # second operand
+
+    if not (isinstance(op, Const) and op.value is None):
+        return term
+    if not (isinstance(lhs, Const) and lhs.value is not None):
+        return term
+    if not (isinstance(rhs, Const) and rhs.value is not None):
+        return term
+
+    if op.name == "Add":
+        return Const("_add", lhs.value + rhs.value)
+    if op.name == "Mul":
+        return Const("_mul", lhs.value * rhs.value)
+
+    return term
+
+
 def subst(term: Term, var: str, replacement: Term) -> Term:
     """Capture-avoiding substitution of `var` with `replacement` in `term`."""
     if isinstance(term, Var):
@@ -26,6 +66,10 @@ def subst(term: Term, var: str, replacement: Term) -> Term:
 
 def _step(term: Term) -> Term:
     if isinstance(term, App):
+        # First try built-in tensor evaluation (Add/Mul on valued Consts)
+        evaled = _try_eval_builtin(term)
+        if evaled is not term:
+            return evaled
         if isinstance(term.func, Lam):
             return subst(term.func.body, term.func.var, term.arg)
         new_func = _step(term.func)

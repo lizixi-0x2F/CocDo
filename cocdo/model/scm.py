@@ -6,9 +6,10 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from ..kernel.terms import Sort, Var, Const, Pi, Lam, App, Term, Add
+from ..kernel.terms import Sort, Var, Const, Pi, Lam, App, Term, Add, Mul
 from ..kernel.reduction import beta_reduce, subst
 from ..kernel.typing import Context, type_of, check_intervention
+from .causal_ffnn import topo_order_from_A
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +96,8 @@ class NeuralSCM:
         A             : (N, N) causal weight matrix from CausalFFNN
         E_raw         : (n_samples, N, D) per-sample embeddings
         topo_order    : node names in topological order (roots first).
-                        If None, defaults to var_names order.
+                        If None, inferred automatically from A via Kahn's
+                        algorithm on the thresholded adjacency matrix.
         edge_threshold: minimum A[i,j] weight to register an edge
 
         Returns
@@ -107,9 +109,12 @@ class NeuralSCM:
         E = np.sqrt((E_raw ** 2).mean(axis=0))   # (N, D)
         U = E - A.T @ E                           # exogenous residual
 
+        if topo_order is None:
+            topo_order = topo_order_from_A(A, var_names)
+
         scm = cls(var_names=var_names, A=A, E=E, U=U, topo_order=topo_order)
 
-        order = topo_order if topo_order is not None else var_names
+        order = topo_order
         for i, p in enumerate(order):
             for j, c in enumerate(order):
                 if i < j:
@@ -171,9 +176,12 @@ class NeuralSCM:
         weights = node.parent_weights
 
         # body: weighted sum  Σ w_i * Var(p_i)
-        body: Term = App(Const(f"w_{parents[0]}->{child}", weights[parents[0]]), Var(parents[0]))
+        # Encoded as App(App(Mul, Const(w)), Var(p)) so that when do(p=v) fires,
+        # subst replaces Var(p) → Const(v), and beta_reduce evaluates
+        # App(App(Mul, Const(w)), Const(v)) → Const(w*v) via _try_eval_builtin.
+        body: Term = App(App(Mul, Const(f"w_{parents[0]}->{child}", weights[parents[0]])), Var(parents[0]))
         for p in parents[1:]:
-            term_p = App(Const(f"w_{p}->{child}", weights[p]), Var(p))
+            term_p = App(App(Mul, Const(f"w_{p}->{child}", weights[p])), Var(p))
             body = App(App(Add, body), term_p)
 
         # curried Lam: Lam(p1, Sort(0), Lam(p2, Sort(0), ... body))

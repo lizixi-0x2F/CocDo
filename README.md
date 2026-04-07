@@ -2,42 +2,46 @@
 
 **A minimal causal world model — learn causal graphs, intervene, plan.**
 
-CocDo learns a causal graph from observations, then lets you run `do(X=v)` interventions, counterfactuals, and gradient-based planning — all type-checked by a lightweight COC kernel that rejects cycles and inconsistent queries at build time.
+CocDo fuses two ideas that rarely appear together:
+
+- **Pearl's do-calculus** — `do(X=v)` severs incoming edges and propagates effects through a structural causal model
+- **COC type theory** — every edge `X → Y` is encoded as a dependent Pi-type `Π(X : Typeᵢ). Typeⱼ` where `i < j` follows topological order; cycles are structurally impossible to express
+
+The result: a differentiable SCM where planning is gradient descent, not RL, and interventions are literally lambda-calculus term substitution.
 
 ```python
 from cocdo import CausalFFNN, NeuralSCM
 from cocdo.model import CausalPlanner
 import torch
 
-# 1. Learn causal weights
+# 1. Learn causal weights from embeddings (NOTEARS acyclicity enforced during training)
 ffnn = CausalFFNN(d_embed=32)
-# ... training loop: loss = ((X @ A - X)**2).mean() ...
+# loss = recon + λ·h(A) + ρ/2·h(A)²   where h(A) = tr(e^{A∘A}) - n
 
-# 2. Build the causal world model (one call)
+# 2. Build the causal world model — topo_order inferred automatically from A
 with torch.no_grad():
     A, _ = ffnn(E_raw)
 scm = NeuralSCM.from_embeddings(
-    var_names  = ["ad_spend", "clicks", "revenue"],
-    A          = A.numpy(),
-    E_raw      = E_raw.numpy(),
-    topo_order = ["ad_spend", "clicks", "revenue"],
+    var_names = ["ad_spend", "clicks", "revenue"],
+    A         = A.numpy(),
+    E_raw     = E_raw.numpy(),
+    # topo_order omitted — auto-extracted via Kahn's algorithm
 )
 
-# 3. Intervene
+# 3. Intervene — causal effect, not correlation
 state, _ = scm.step({"ad_spend": 3.0})
-print(state["revenue"])          # causal effect, not correlation
 
 # 4. Counterfactual  (Pearl layer 3)
 cf = scm.counterfactual({"ad_spend": 3.0}, target="revenue")
 
-# 5. Gradient planning — find the optimal action, no sampling
+# 5. Gradient planning — no sampling, no RL
 planner = CausalPlanner(scm)
 result  = planner.plan(
     E_init       = scm._E,
     target       = {"revenue": 2.5},
     interv_nodes = ["ad_spend"],
 )
-print(result["a_opt"])           # {"ad_spend": 1.84}
+print(result["a_opt"])   # {"ad_spend": 1.84}
 ```
 
 ---
@@ -46,17 +50,64 @@ print(result["a_opt"])           # {"ad_spend": 1.84}
 
 ```
 Observations  (N samples, N vars)
-    ↓  CausalFFNN        pairwise edge scorer → sigmoid A ∈ R^{N×N}
-    ↓  from_embeddings   RMS embeddings + exogenous residuals U
-    ↓  NeuralSCM         COC type-checks the graph, rejects cycles
-    ↓  do() / step()     Pearl do-calculus via term substitution + β-reduction
-    ↓  counterfactual()  Abduction → Action → Prediction
-    ↓  CausalPlanner     Adam on ‖‖E_next[j]‖ − target_j‖² — no RL needed
+    │
+    ├─ CausalFFNN        pairwise sigmoid scorer → A ∈ ℝ^{N×N}
+    │                    + NOTEARS acyclicity loss → no manual topo_order needed
+    │
+    ├─ from_embeddings   RMS embeddings E + exogenous residuals U = E − AᵀE
+    │                    topo_order auto-extracted from A via Kahn's algorithm
+    │
+    ├─ NeuralSCM         COC type-checks the graph, rejects cycles as TypeError
+    │
+    ├─ do() / step()     subst(Var(X), Const(v)) + β-reduce → tensor value
+    │                    propagation happens inside the COC kernel, not numpy
+    │
+    ├─ counterfactual()  Abduction → Action → Prediction
+    │
+    └─ CausalPlanner     Adam on Σ (‖E_next[j]‖ − target_j)²
 ```
 
-**COC type guard** — every edge `X → Y` is encoded as a dependent Pi-type `Π(X : Typeᵢ). Typeⱼ` where `i < j` follows topological order. Any edge that would introduce a cycle raises `TypeError` before touching any matrix.
+**COC type guard** — the kernel runs before any matrix computation. A failed check leaves the SCM completely unmodified.
 
-**Norm-based energy** — the planner minimises `Σ (‖E_next[j]‖ − target_j)²`. Comparing embedding norms rather than full vectors eliminates direction-misalignment, so the energy is exactly zero at the true solution.
+**Norm-based energy** — comparing embedding norms rather than full vectors eliminates direction-misalignment; the energy is exactly zero at the true solution.
+
+**`do()` as β-reduction** — `do(X=v)` is `subst(mechanism, X, Const(v))` + `beta_reduce`. When both operands of `Add`/`Mul` are valued `Const`s, the kernel evaluates them directly: `App(App(Mul, Const(w)), Const(v)) → Const(w·v)`. The causal propagation happens inside the term language, not in a separate numpy pass.
+
+**NOTEARS acyclicity** — during training, the augmented Lagrangian penalty `h(A) = tr(e^{A∘A}) − n` is added to the reconstruction loss. `h(A) = 0` iff `A` is a DAG. The multiplier schedule tightens automatically every 50 epochs.
+
+---
+
+## Simulating the world
+
+CocDo's world model is a **Neural Structural Causal Model**: a directed graph where each node is a variable and each edge carries a learned continuous weight.
+
+The world state lives in **embedding space** — each variable has a D-dimensional vector `E_j` whose L2 norm is its "intensity". The structural equation is:
+
+```
+E_j = Σᵢ A[i,j] · E_i  +  U_j
+```
+
+where `U_j = E_j − AᵀE_j` is the exogenous noise (what the parents don't explain).
+
+**Simulating a trajectory** means choosing which variables to fix (`do()`), zeroing their incoming edges in `A`, and letting the rest propagate:
+
+```python
+# One causal step
+state, E_next = scm.step({"rainfall": 2.0})
+
+# Multi-step rollout — each step's E_next feeds the next
+traj, reward = scm.rollout(
+    action_sequence = [{"rainfall": 2.0}, {"rainfall": 1.5}, {}],
+    reward_fn       = lambda s, t: s["crop_yield"],
+    discount        = 0.95,
+)
+```
+
+**Counterfactuals** answer "what would have happened if X had been different, given everything else we observed?" via Pearl's three-step: abduct `U` from observations, act by fixing X, predict by re-running the structural equations.
+
+**Planning** closes the loop — instead of hand-picking intervention values, `CausalPlanner` searches for the `do()` values that minimise the distance to a target state, entirely by gradient descent through the causal graph.
+
+The key modelling choice: **nodes are embeddings, not scalars**. This means any system whose state can be represented as vectors — token hidden states, sensor readings projected to a shared space, entity embeddings from a knowledge graph — can be dropped into CocDo without a separate observation model.
 
 ---
 
@@ -72,6 +123,51 @@ Requires Python ≥ 3.10, PyTorch ≥ 2.0, NumPy ≥ 1.24.
 
 ---
 
+## Examples
+
+### Synthetic DAG (gCastle)
+
+```bash
+pip install gcastle
+python examples/demo_gcastle.py
+```
+
+Generates a random 5-node linear Gaussian DAG, trains `CausalFFNN` with NOTEARS constraint on 1000 observations, builds the SCM with auto-inferred topo_order, runs the planner:
+
+```
+CocDo learned continuous A (top edges):
+  x0 → x1  (w=0.996)    x0 → x2  (w=0.940)    x0 → x3  (w=0.999)
+  x1 → x3  (w=0.980)    x2 → x1  (w=0.997)    x2 → x3  (w=0.999)
+
+Planner — recover x0 s.t. x3 = do(x0=3.0):
+  optimal x0 = 3.0000   energy = 0.000000  ✓
+
+Joint intervention (x0, x1, x2) — same target, multiple solutions:
+  a_opt = {x0: 2.986, x1: 0.067, x2: 2.448}   energy = 0.000000  ✓
+```
+
+> **Note:** On Python ≥ 3.11, `pip install gcastle` works directly.
+
+---
+
+### LLM generation steering
+
+```bash
+pip install transformers
+python examples/demo_llm_causal.py
+```
+
+Applies the causal framework directly to a running LLM (SmolLM2-135M-Instruct):
+
+1. Pool the full `(L, H, T, T)` attention stack to a `(T, T)` causal adjacency matrix — tokens are causal nodes
+2. Use final-layer hidden states as node embeddings
+3. Run `step({token_node: scale})` to steer representations before generation
+4. Use `CausalPlanner` to find the optimal amplitudes that drive a target token's embedding norm to a reference value
+
+This reframes LLM generation steering as a causal planning problem: instead of tuning prompts or fine-tuning weights, you intervene on the causal graph of token influences.
+
+---
+
 ## API
 
 ### `CausalFFNN`
@@ -83,67 +179,69 @@ ffnn = CausalFFNN(d_embed, hidden=256)
 A, logits = ffnn(E)   # E: (B, N, D) or (N, D)  →  A: (N, N)
 ```
 
-Each entry `A[i,j] ∈ (0,1)` is a sigmoid gate — the causal strength of edge `i → j`. Diagonal is forced to zero (no self-loops).
+Each `A[i,j] ∈ (0,1)` is a sigmoid gate — causal strength of edge `i → j`. Diagonal forced to zero. Edges compete independently (sigmoid, not softmax), giving natural sparsity.
 
-**Training loss** — structural equation supervised on scalar observations:
+**Training with acyclicity constraint:**
 ```python
-loss = ((X @ A - X) ** 2).mean()   # X: (B, N) scalar observations
+from cocdo.model.causal_ffnn import acyclicity_loss
+
+rho, lam = 1.0, 0.0
+for epoch in range(500):
+    A, _ = ffnn(E_raw)
+    recon = ((X @ A - X) ** 2).mean()
+    h     = acyclicity_loss(A)          # = tr(e^{A∘A}) - n,  0 iff DAG
+    loss  = recon + lam * h + (rho / 2) * h ** 2
+    loss.backward(); optim.step()
+    # tighten multipliers every N steps: lam += rho * h; rho *= 10 if needed
 ```
+
+**Auto topo_order:**
+```python
+from cocdo.model.causal_ffnn import topo_order_from_A
+order = topo_order_from_A(A_np, var_names)   # Kahn's algorithm on thresholded A
+```
+
+---
 
 ### `NeuralSCM`
 
-The causal world model. Build it with `from_embeddings`:
-
 ```python
 scm = NeuralSCM.from_embeddings(
-    var_names,       # list of N node names
-    A,               # (N, N) from CausalFFNN
-    E_raw,           # (n_samples, N, D) per-sample embeddings
-    topo_order,      # node names sorted root-first
-    edge_threshold,  # minimum A[i,j] to register an edge (default 1e-4)
+    var_names,          # list of N node names
+    A,                  # (N, N) causal weight matrix
+    E_raw,              # (n_samples, N, D) per-sample embeddings
+    topo_order=None,    # if None, auto-inferred from A
+    edge_threshold=1e-4,
 )
 ```
 
-Internally computes RMS embeddings `E = sqrt(mean(E_raw²))` and residuals `U = E − A^T E`, then adds all edges respecting topological order.
+Internally: `E = sqrt(mean(E_raw²))` (RMS), `U = E − AᵀE` (exogenous residuals).
 
 | Method | Description |
 |--------|-------------|
 | `do(var, value) → NeuralSCM` | Intervention — severs incoming edges, returns new SCM |
-| `step(interventions, E_init)` | One-step causal propagation: `E_next = A_do^T E_do + U` |
+| `step(interventions, E_init)` | One step: `E_next = A_doᵀ E_do + U` |
 | `rollout(action_sequence, reward_fn, discount)` | H-step rollout with discounted reward |
 | `counterfactual(interventions, target)` | Pearl 3-step: abduction → action → prediction |
-| `infer_effect(target) → float` | Predict target scalar from structural equation |
+
+---
 
 ### `CausalPlanner`
-
-Gradient-based optimal intervention search.
 
 ```python
 planner = CausalPlanner(scm)
 result  = planner.plan(
-    E_init,          # scm._E  (RMS embeddings)
-    target,          # {var_name: desired_scalar}
+    E_init,          # scm._E
+    target,          # {var_name: desired_scalar_norm}
     interv_nodes,    # variables to optimise over
     lr=0.05,
     steps=200,
     rollout_steps=1, # increase for multi-hop paths (X→Y→Z needs 2)
 )
-# result: {"a_opt": {name: value}, "energy": float, "history": [...]}
+# {"a_opt": {name: value}, "energy": float, "history": [...]}
 ```
 
-Energy function (exact zero at solution):
-```
-a* = argmin_a  Σ_j (‖E_next[j]‖ − target_j)²
-```
-
-### `NodeProjector`
-
-Projects node embeddings to scalar observations.
-
-```python
-proj = NodeProjector(d_embed)
-y = proj(E)   # (N, D) → (N,)
-```
+Energy: `a* = argmin_a  Σⱼ (‖E_next[j]‖ − target_j)²`
 
 ---
 
@@ -151,36 +249,16 @@ y = proj(E)   # (N, D) → (N,)
 
 ```
 cocdo/kernel/
-├── terms.py      # AST: Sort, Var, Const, Pi, Lam, App
-├── reduction.py  # capture-avoiding substitution + call-by-value β-reduction
+├── terms.py      # AST: Sort, Var, Const, Pi, Lam, App, Add, Mul
+├── reduction.py  # capture-avoiding substitution + tensor-aware β-reduction
 └── typing.py     # type_of(), check_intervention()
 ```
 
-`do(X = v)` is implemented as `subst(mechanism, X, Const(v))` followed by `beta_reduce`. The type checker runs before any numpy computation — a failed check leaves the SCM untouched.
-
----
-
-## gCastle benchmark
-
-Validated against synthetic DAGs from [gCastle](https://github.com/huawei-noah/trustworthyAI/tree/master/gcastle):
-
-```bash
-pip install gcastle
-python examples/demo_gcastle.py
-```
-
-```
-ground-truth edges:
-  x0 → x1  x0 → x2  x0 → x3
-  x1 → x3  x2 → x1  x2 → x3
-
-CocDo learned A (strongest edges):
-  x0 → x3  (w=0.974)    x1 → x3  (w=1.000)    x2 → x3  (w=0.988)
-  x0 → x1  (w=0.979)    x2 → x1  (w=0.987)
-
-Planner — find x0 s.t. x3 reaches do(x0=3.0) value:
-  optimal x0 = 3.0000   energy = 0.000000  ✓
-```
+- `Sort(i)` — universe level = topological depth. Root nodes are `Sort(0)`, their children `Sort(1)`, etc.
+- `Pi(X, Typeᵢ, Typeⱼ)` — encodes edge `X → Y`. Requiring `i < j` makes cycles a type error.
+- `subst(term, var, replacement)` — capture-avoiding; implements `do()`
+- `beta_reduce(term)` — call-by-value to fixpoint; evaluates `Add`/`Mul` on valued `Const`s directly
+- `Add`, `Mul` — built-in binary operators; `App(App(Mul, Const(w)), Const(v)) → Const(w·v)`
 
 ---
 
@@ -189,15 +267,16 @@ Planner — find x0 s.t. x3 reaches do(x0=3.0) value:
 ```
 cocdo/
 ├── kernel/
-│   ├── terms.py        COC AST nodes
-│   ├── reduction.py    β-reduction + substitution
+│   ├── terms.py        COC AST nodes + Add, Mul built-ins
+│   ├── reduction.py    β-reduction + tensor-aware builtin evaluation
 │   └── typing.py       type checker + intervention guard
 └── model/
-    ├── causal_ffnn.py  CausalFFNN, NodeProjector
+    ├── causal_ffnn.py  CausalFFNN, NodeProjector, acyclicity_loss, topo_order_from_A
     ├── scm.py          NeuralSCM — do(), rollout(), counterfactual(), from_embeddings()
     └── planner.py      CausalPlanner — norm-based energy, Adam planning
 examples/
-└── demo_gcastle.py     gCastle synthetic DAG → full pipeline
+├── demo_gcastle.py     gCastle synthetic DAG → full pipeline (NOTEARS + auto topo)
+└── demo_llm_causal.py  LLM attention → causal graph → generation steering
 ```
 
 ---

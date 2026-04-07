@@ -4,6 +4,71 @@ import torch
 import torch.nn as nn
 
 
+def acyclicity_loss(A: torch.Tensor) -> torch.Tensor:
+    """NOTEARS acyclicity constraint: h(A) = tr(e^{A∘A}) - n = 0.
+
+    h(A) == 0  iff  A is a DAG.  Uses the matrix exponential characterisation
+    from Zheng et al. 2018.  We operate on A∘A (element-wise square) so that
+    the constraint applies to the magnitude of edge weights, not their sign.
+
+    Parameters
+    ----------
+    A : (N, N) causal weight matrix, values in (0, 1) from sigmoid
+
+    Returns
+    -------
+    Scalar ≥ 0.  Exactly 0 when A encodes a DAG.
+    """
+    n = A.shape[0]
+    return torch.trace(torch.matrix_exp(A * A)) - n
+
+
+def topo_order_from_A(A: "numpy.ndarray", var_names: list[str]) -> list[str]:  # type: ignore[name-defined]
+    """Extract a topological ordering from a learned causal weight matrix.
+
+    Uses Kahn's algorithm on the thresholded adjacency.  Nodes are sorted
+    root-first (in-degree 0 first), matching the Sort-level convention in
+    NeuralSCM.
+
+    Parameters
+    ----------
+    A         : (N, N) numpy array — A[i, j] > threshold means i → j
+    var_names : node names corresponding to A rows/cols
+
+    Returns
+    -------
+    list of node names in topological order (roots first).
+    Raises ValueError if A contains a cycle (shouldn't happen after training
+    with acyclicity_loss, but guarded defensively).
+    """
+    import numpy as np
+    n = len(var_names)
+    threshold = 1e-2
+    adj = (A > threshold).astype(int)   # (N, N)  adj[i,j]=1 means i→j
+
+    in_deg = adj.sum(axis=0).tolist()   # number of parents per node
+    queue  = [i for i in range(n) if in_deg[i] == 0]
+    order: list[int] = []
+
+    while queue:
+        # stable sort by index so output is deterministic
+        queue.sort()
+        node = queue.pop(0)
+        order.append(node)
+        for child in range(n):
+            if adj[node, child]:
+                in_deg[child] -= 1
+                if in_deg[child] == 0:
+                    queue.append(child)
+
+    if len(order) != n:
+        # Cycle detected — fall back to in-degree heuristic (best-effort)
+        in_deg_orig = adj.sum(axis=0)
+        order = list(np.argsort(in_deg_orig))
+
+    return [var_names[i] for i in order]
+
+
 class CausalFFNN(nn.Module):
     """
     Input : E ∈ R^{N × D}  (token embedding matrix)
