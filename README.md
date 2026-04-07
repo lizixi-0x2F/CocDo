@@ -1,112 +1,213 @@
 # CocDo
 
-**Causal discovery + do-calculus, grounded in type theory.**
+**A minimal causal world model — learn causal graphs, intervene, plan.**
 
-CocDo learns a causal graph from observational data, then lets you run interventions (`do(X=v)`), counterfactuals, and multi-step causal rollouts — all type-checked by a lightweight COC kernel that rejects logically inconsistent queries at build time.
+CocDo learns a causal graph from observations, then lets you run `do(X=v)` interventions, counterfactuals, and gradient-based planning — all type-checked by a lightweight COC kernel that rejects cycles and inconsistent queries at build time.
 
 ```python
-from cocdo import CocDo
+from cocdo import CausalFFNN, NeuralSCM
+from cocdo.model import CausalPlanner
+import torch
 
-# 1. Train
-model = CocDo(d_embed=32)
-# ... training loop (see examples/) ...
+# 1. Learn causal weights
+ffnn = CausalFFNN(d_embed=32)
+# ... training loop: loss = ((X @ A - X)**2).mean() ...
 
-# 2. Build causal graph
-scm = model.build(pos_emb, var_names=["ad_spend", "clicks", "conversions"])
+# 2. Build the causal world model (one call)
+with torch.no_grad():
+    A, _ = ffnn(E_raw)
+scm = NeuralSCM.from_embeddings(
+    var_names  = ["ad_spend", "clicks", "revenue"],
+    A          = A.numpy(),
+    E_raw      = E_raw.numpy(),
+    topo_order = ["ad_spend", "clicks", "revenue"],
+)
 
 # 3. Intervene
 state, _ = scm.step({"ad_spend": 3.0})
-print(state["conversions"])   # causal effect, not correlation
+print(state["revenue"])          # causal effect, not correlation
 
-# 4. Counterfactual
-cf = model.counterfactual({"ad_spend": 3.0}, target="conversions")
+# 4. Counterfactual  (Pearl layer 3)
+cf = scm.counterfactual({"ad_spend": 3.0}, target="revenue")
+
+# 5. Gradient planning — find the optimal action, no sampling
+planner = CausalPlanner(scm)
+result  = planner.plan(
+    E_init       = scm._E,
+    target       = {"revenue": 2.5},
+    interv_nodes = ["ad_spend"],
+)
+print(result["a_opt"])           # {"ad_spend": 1.84}
 ```
+
+---
 
 ## How it works
 
 ```
-Observations (B, N)
-    ↓  CausalFFNN          learns A ∈ R^{N×N}  (sigmoid edge weights)
-    ↓  build()             COC type-checks the graph, rejects cycles
-    ↓  do() / step()       Pearl do-calculus via term substitution + β-reduction
-    ↓  counterfactual()    Abduction → Action → Prediction (Pearl Layer 3)
+Observations  (N samples, N vars)
+    ↓  CausalFFNN        pairwise edge scorer → sigmoid A ∈ R^{N×N}
+    ↓  from_embeddings   RMS embeddings + exogenous residuals U
+    ↓  NeuralSCM         COC type-checks the graph, rejects cycles
+    ↓  do() / step()     Pearl do-calculus via term substitution + β-reduction
+    ↓  counterfactual()  Abduction → Action → Prediction
+    ↓  CausalPlanner     Adam on ‖‖E_next[j]‖ − target_j‖² — no RL needed
 ```
 
-**COC type guard** — each causal edge `X → Y` is encoded as a dependent Pi-type `Π(X:Typeᵢ). Typeⱼ` where `i < j`. Any edge that would introduce a cycle raises `TypeError` before touching the neural state.
+**COC type guard** — every edge `X → Y` is encoded as a dependent Pi-type `Π(X : Typeᵢ). Typeⱼ` where `i < j` follows topological order. Any edge that would introduce a cycle raises `TypeError` before touching any matrix.
+
+**Norm-based energy** — the planner minimises `Σ (‖E_next[j]‖ − target_j)²`. Comparing embedding norms rather than full vectors eliminates direction-misalignment, so the energy is exactly zero at the true solution.
+
+---
 
 ## Install
 
 ```bash
-pip install -e .   # from repo root
+git clone https://github.com/lizixi-0x2F/CocDo
+cd CocDo
+pip install -e .
 ```
 
 Requires Python ≥ 3.10, PyTorch ≥ 2.0, NumPy ≥ 1.24.
 
-## Quick demo
-
-```bash
-python examples/demo_ad_attribution.py
-```
-
-Expected output:
-
-```
-发现的因果图（child: [parents]）:
-  ad_spend  (根节点)
-  ad_spend → clicks
-  clicks → conversions
-
-== do() 干预：强制设定 ad_spend，看 conversions 怎么变 ==
-  场景             ad_spend   clicks  conversions
-  基线                0.507    0.812        0.561
-  do(=1.0)          1.000    0.846        0.555
-  do(=3.0)          3.000    1.861        0.537
-```
-
-The model discovers `ad_spend → clicks → conversions` from raw observations, with no graph structure provided.
+---
 
 ## API
 
+### `CausalFFNN`
+
+Learns the causal weight matrix from embeddings.
+
+```python
+ffnn = CausalFFNN(d_embed, hidden=256)
+A, logits = ffnn(E)   # E: (B, N, D) or (N, D)  →  A: (N, N)
+```
+
+Each entry `A[i,j] ∈ (0,1)` is a sigmoid gate — the causal strength of edge `i → j`. Diagonal is forced to zero (no self-loops).
+
+**Training loss** — structural equation supervised on scalar observations:
+```python
+loss = ((X @ A - X) ** 2).mean()   # X: (B, N) scalar observations
+```
+
+### `NeuralSCM`
+
+The causal world model. Build it with `from_embeddings`:
+
+```python
+scm = NeuralSCM.from_embeddings(
+    var_names,       # list of N node names
+    A,               # (N, N) from CausalFFNN
+    E_raw,           # (n_samples, N, D) per-sample embeddings
+    topo_order,      # node names sorted root-first
+    edge_threshold,  # minimum A[i,j] to register an edge (default 1e-4)
+)
+```
+
+Internally computes RMS embeddings `E = sqrt(mean(E_raw²))` and residuals `U = E − A^T E`, then adds all edges respecting topological order.
+
 | Method | Description |
-|---|---|
-| `CocDo(d_embed, hidden)` | Create model |
-| `model.train_step(y_batch, pos_emb, val_scale)` | Single training step, returns `{"loss": ...}` |
-| `model.build(pos_emb, var_names, topo_order=None)` | Build `NeuralSCM` from learned weights |
-| `model.do(var, value)` | Intervention — returns new `NeuralSCM` |
-| `model.counterfactual(interventions, target)` | Pearl 3-step counterfactual |
-| `scm.step(interventions)` | One-step causal propagation |
-| `scm.rollout(action_sequence, reward_fn)` | H-step rollout with discounted reward |
-| `model.causal_graph()` | `{child: [parents]}` dict |
+|--------|-------------|
+| `do(var, value) → NeuralSCM` | Intervention — severs incoming edges, returns new SCM |
+| `step(interventions, E_init)` | One-step causal propagation: `E_next = A_do^T E_do + U` |
+| `rollout(action_sequence, reward_fn, discount)` | H-step rollout with discounted reward |
+| `counterfactual(interventions, target)` | Pearl 3-step: abduction → action → prediction |
+| `infer_effect(target) → float` | Predict target scalar from structural equation |
 
-## Use cases
+### `CausalPlanner`
 
-- **Ad attribution** — isolate causal effect of spend from confounders
-- **DeFi risk** — counterfactual stress-test: "if ETH drops 30%, what's liquidation volume?"
-- **Root cause analysis** — which upstream variable actually caused the anomaly?
-- **Mechanism design** — simulate policy changes before deploying them
+Gradient-based optimal intervention search.
 
-## Architecture
+```python
+planner = CausalPlanner(scm)
+result  = planner.plan(
+    E_init,          # scm._E  (RMS embeddings)
+    target,          # {var_name: desired_scalar}
+    interv_nodes,    # variables to optimise over
+    lr=0.05,
+    steps=200,
+    rollout_steps=1, # increase for multi-hop paths (X→Y→Z needs 2)
+)
+# result: {"a_opt": {name: value}, "energy": float, "history": [...]}
+```
+
+Energy function (exact zero at solution):
+```
+a* = argmin_a  Σ_j (‖E_next[j]‖ − target_j)²
+```
+
+### `NodeProjector`
+
+Projects node embeddings to scalar observations.
+
+```python
+proj = NodeProjector(d_embed)
+y = proj(E)   # (N, D) → (N,)
+```
+
+---
+
+## COC kernel
+
+```
+cocdo/kernel/
+├── terms.py      # AST: Sort, Var, Const, Pi, Lam, App
+├── reduction.py  # capture-avoiding substitution + call-by-value β-reduction
+└── typing.py     # type_of(), check_intervention()
+```
+
+`do(X = v)` is implemented as `subst(mechanism, X, Const(v))` followed by `beta_reduce`. The type checker runs before any numpy computation — a failed check leaves the SCM untouched.
+
+---
+
+## gCastle benchmark
+
+Validated against synthetic DAGs from [gCastle](https://github.com/huawei-noah/trustworthyAI/tree/master/gcastle):
+
+```bash
+pip install gcastle
+python examples/demo_gcastle.py
+```
+
+```
+ground-truth edges:
+  x0 → x1  x0 → x2  x0 → x3
+  x1 → x3  x2 → x1  x2 → x3
+
+CocDo learned A (strongest edges):
+  x0 → x3  (w=0.974)    x1 → x3  (w=1.000)    x2 → x3  (w=0.988)
+  x0 → x1  (w=0.979)    x2 → x1  (w=0.987)
+
+Planner — find x0 s.t. x3 reaches do(x0=3.0) value:
+  optimal x0 = 3.0000   energy = 0.000000  ✓
+```
+
+---
+
+## Repository layout
 
 ```
 cocdo/
 ├── kernel/
-│   ├── terms.py       # COC AST: Sort, Var, Pi, Lam, App, Const
-│   ├── reduction.py   # β-reduction + substitution
-│   └── typing.py      # type_of(), check_intervention()
+│   ├── terms.py        COC AST nodes
+│   ├── reduction.py    β-reduction + substitution
+│   └── typing.py       type checker + intervention guard
 └── model/
-    ├── causal_ffnn.py # Pairwise edge scorer → sigmoid A matrix
-    ├── scm.py         # NeuralSCM: do(), counterfactual(), rollout()
-    └── cocdo.py       # CocDo: train_step(), build(), unified interface
+    ├── causal_ffnn.py  CausalFFNN, NodeProjector
+    ├── scm.py          NeuralSCM — do(), rollout(), counterfactual(), from_embeddings()
+    └── planner.py      CausalPlanner — norm-based energy, Adam planning
+examples/
+└── demo_gcastle.py     gCastle synthetic DAG → full pipeline
 ```
 
-## Citation
+---
 
-If you use CocDo in research, please cite:
+## Citation
 
 ```bibtex
 @software{cocdo2026,
   author = {lizixi},
-  title  = {CocDo: Neural Causal Discovery with COC Type-Theoretic Interventions},
+  title  = {CocDo: A Minimal Causal World Model with COC Type-Theoretic Interventions},
   year   = {2026},
   url    = {https://github.com/lizixi-0x2F/CocDo}
 }

@@ -24,9 +24,13 @@ class CausalFFNN(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
         )
         self.pair_score = nn.Sequential(
             nn.Linear(hidden * 2, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
             nn.ReLU(),
             nn.Linear(hidden, 1),
         )
@@ -37,25 +41,33 @@ class CausalFFNN(nn.Module):
         nn.init.constant_(last.bias, 0.0)    # sigmoid(0) = 0.5，无稀疏先验
 
     def forward(self, E: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """E: (N, D) → (A, logits).
+        """E: (B, N, D) or (N, D) → (A, logits).
+
+        When E is (B, N, D), token representations are aggregated across the
+        batch via mean+max pooling before pairwise scoring, so A reflects the
+        full sample distribution rather than a single mean embedding.
 
         A[i,j] = sigmoid(logits[i,j]), diagonal zeroed (no self-loops).
-        logits returned for downstream use (e.g. regularisation).
         """
-        N, _ = E.shape
-        H  = self.token_enc(E)                              # (N, hidden)
-        Hi = H.unsqueeze(1).expand(N, N, -1)               # (N, N, hidden)
-        Hj = H.unsqueeze(0).expand(N, N, -1)               # (N, N, hidden)
+        if E.dim() == 2:
+            E = E.unsqueeze(0)          # (1, N, D)
+        B, N, _ = E.shape
+        H = self.token_enc(E.reshape(B * N, -1)).reshape(B, N, -1)  # (B, N, hidden)
+        # Aggregate across batch: mean + max → (N, 2*hidden)
+        H_mean = H.mean(dim=0)          # (N, hidden)
+        H_max  = H.max(dim=0).values    # (N, hidden)
+        H_agg  = H_mean + H_max         # (N, hidden)  sum keeps dim for pair_score
+
+        Hi = H_agg.unsqueeze(1).expand(N, N, -1)   # (N, N, hidden)
+        Hj = H_agg.unsqueeze(0).expand(N, N, -1)   # (N, N, hidden)
         logits = self.pair_score(
             torch.cat([Hi, Hj], dim=-1)
-        ).squeeze(-1)                                       # (N, N)
+        ).squeeze(-1)                               # (N, N)
 
         logits = logits / (self._score_dim ** 0.5)
 
-        # Zero diagonal — no self-loops
         diag_mask = torch.eye(N, device=E.device, dtype=torch.bool)
         logits = logits.masked_fill(diag_mask, float("-inf"))
-
         A = torch.sigmoid(logits)
         A = A.masked_fill(diag_mask, 0.0)
         return A, logits

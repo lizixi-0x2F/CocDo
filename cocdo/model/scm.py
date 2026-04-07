@@ -6,7 +6,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from ..kernel.terms import Sort, Var, Const, Pi, Lam, App, Term
+from ..kernel.terms import Sort, Var, Const, Pi, Lam, App, Term, Add
 from ..kernel.reduction import beta_reduce, subst
 from ..kernel.typing import Context, type_of, check_intervention
 
@@ -74,6 +74,53 @@ class NeuralSCM:
             self.coc_context[name] = node_type
             self.coc_context[f"val_{name}"] = Var(name)
 
+    @classmethod
+    def from_embeddings(
+        cls,
+        var_names: list[str],
+        A: np.ndarray,
+        E_raw: np.ndarray,
+        topo_order: Optional[list[str]] = None,
+        edge_threshold: float = 1e-4,
+    ) -> "NeuralSCM":
+        """Standard build path: construct SCM from raw sample embeddings.
+
+        Computes RMS embeddings (rather than mean) so that each node's
+        embedding has a stable non-zero norm — required for CausalPlanner
+        to have well-defined intervention directions.
+
+        Parameters
+        ----------
+        var_names     : node names, length N
+        A             : (N, N) causal weight matrix from CausalFFNN
+        E_raw         : (n_samples, N, D) per-sample embeddings
+        topo_order    : node names in topological order (roots first).
+                        If None, defaults to var_names order.
+        edge_threshold: minimum A[i,j] weight to register an edge
+
+        Returns
+        -------
+        NeuralSCM with all edges added and matrices set.
+        """
+        # RMS embedding: captures the typical magnitude of each node's embedding
+        # without cancellation from zero-mean distributions.
+        E = np.sqrt((E_raw ** 2).mean(axis=0))   # (N, D)
+        U = E - A.T @ E                           # exogenous residual
+
+        scm = cls(var_names=var_names, A=A, E=E, U=U, topo_order=topo_order)
+
+        order = topo_order if topo_order is not None else var_names
+        for i, p in enumerate(order):
+            for j, c in enumerate(order):
+                if i < j:
+                    pi = var_names.index(p)
+                    ci = var_names.index(c)
+                    w  = float(A[pi, ci])
+                    if w > edge_threshold:
+                        scm.add_causal_edge(p, c, weight=w)
+
+        return scm
+
     def add_causal_edge(self, parent: str, child: str, weight: float = 1.0):
         """
         Add a soft causal edge parent → child with continuous weight.
@@ -107,31 +154,46 @@ class NeuralSCM:
             node.parents.append(parent)
         node.parent_weights[parent] = weight
 
-        # Build mechanism as open App(Lam, Var) so do()-substitution fires.
-        # App(Lam(p, Sort(0), body), Var(p)) — the free Var(p) in the arg
-        # position is the substitution target. After do(p=v):
-        #   subst replaces Var(p) → Const("do_p", v) in the arg
-        #   beta_reduce fires: (Lam(p, Sort(0), body))[Const("do_p",v)]
-        #                    → body with every free Var(p) replaced
-        w = node.parent_weights[parent]
-        weight_const = Const(f"w_{parent}->{child}", w)
+        # Register weight constant in context.
         self.coc_context[f"w_{parent}->{child}"] = Sort(0)
 
-        if node.mechanism is None:
-            body = weight_const
-        else:
-            body = node.mechanism       # wrap existing open term as inner body
+        # Rebuild mechanism as a flat weighted sum over all current parents:
+        #   body = Add(w_p1 * Var(p1), Add(w_p2 * Var(p2), ...))
+        # Wrapped in a curried Lam for each parent, then applied to Var(parent)
+        # so that subst(open_term, p_i, Const(do_p_i, v)) correctly replaces
+        # every Var(p_i) in the body regardless of how many parents exist.
+        #
+        # After do(p_k = v):
+        #   subst replaces Var(p_k) → Const("do_pk", v) everywhere in open_term
+        #   beta_reduce eliminates the Lam(p_k, ...) / App(..., Const) pair
+        #   remaining parents stay as free Var, awaiting their own subst
+        parents = node.parents
+        weights = node.parent_weights
 
-        open_term = App(Lam(parent, Sort(0), body), Var(parent))
+        # body: weighted sum  Σ w_i * Var(p_i)
+        body: Term = App(Const(f"w_{parents[0]}->{child}", weights[parents[0]]), Var(parents[0]))
+        for p in parents[1:]:
+            term_p = App(Const(f"w_{p}->{child}", weights[p]), Var(p))
+            body = App(App(Add, body), term_p)
+
+        # curried Lam: Lam(p1, Sort(0), Lam(p2, Sort(0), ... body))
+        mech: Term = body
+        for p in reversed(parents):
+            mech = Lam(p, Sort(0), mech)
+
+        # open term: App(...App(mech, Var(p1))..., Var(pN))
+        open_term: Term = mech
+        for p in parents:
+            open_term = App(open_term, Var(p))
 
         # Type annotation in context: Pi-chain over all parents → Sort(0)
         mech_pi_type: Term = self.vars[child].coc_type
-        for p in node.parents:
+        for p in parents:
             mech_pi_type = Pi(p, Sort(0), mech_pi_type)
 
         mech_name = f"f_{child}"
-        self.coc_context[mech_name] = mech_pi_type   # type annotation
-        node.mechanism = open_term                    # computational term
+        self.coc_context[mech_name] = mech_pi_type
+        node.mechanism = open_term
         logger.debug("mechanism: %s := %s", mech_name, open_term)
 
     def observe(self, var: str, value: float):
