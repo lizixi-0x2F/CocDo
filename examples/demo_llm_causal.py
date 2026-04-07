@@ -1,12 +1,8 @@
 """
-LLM Attention → CausalSCM with logit-level interventions
-=========================================================
-1. Extract all attention maps from SmolLM2-135M-Instruct
-2. AdaptiveAvgPool2d across (layers, heads) → A_attn (T, T)
-3. Model U from diagonal (self-attention residual)
-4. Build NeuralSCM over token representations
-5. do() interventions → observe next-token logit shifts
-6. CausalPlanner → find optimal token intervention to steer predictions
+LLM Causal Intervention → Generation Steering
+==============================================
+Build causal SCM from attention maps, then steer generation by
+intervening on token representations before the model continues writing.
 """
 import sys
 import numpy as np
@@ -18,7 +14,7 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
 from cocdo import NeuralSCM
 from cocdo.model import CausalPlanner
 
-# ── 1. Load model ──────────────────────────────────────────────────────────────
+# ── Load ───────────────────────────────────────────────────────────────────────
 MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
 print("Loading SmolLM2-135M-Instruct ...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL)
@@ -27,140 +23,124 @@ model     = AutoModelForCausalLM.from_pretrained(
 )
 model.eval()
 
-lm_head  = model.lm_head          # (D, vocab) — projects hidden → logits
-# SmolLM2 ties embeddings, so lm_head.weight is (vocab, D)
-
-def hidden_to_top_tokens(h: np.ndarray, k: int = 5) -> list[tuple[str, float]]:
-    """Project a (D,) hidden state to top-k predicted tokens + probabilities."""
-    with torch.no_grad():
-        logits = lm_head(torch.from_numpy(h).float().unsqueeze(0)).squeeze(0)
-        probs  = torch.softmax(logits, dim=-1)
-        topk   = torch.topk(probs, k)
-    return [
-        (tokenizer.decode([idx.item()]), float(p))
-        for idx, p in zip(topk.indices, topk.values)
-    ]
-
-# ── 2. Forward pass ────────────────────────────────────────────────────────────
-PROMPT = "The cause of the French Revolution was economic inequality"
-inputs = tokenizer(PROMPT, return_tensors="pt")
-tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
-T = len(tokens)
-print(f"\nPrompt : {PROMPT!r}")
-print(f"Tokens ({T}): {tokens}")
+# ── Forward pass — collect attentions + hidden states ─────────────────────────
+PROMPT  = "The cause of the French Revolution was economic inequality"
+inputs  = tokenizer(PROMPT, return_tensors="pt")
+tokens  = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
+T       = len(tokens)
+print(f"\nPrompt: {PROMPT!r}  ({T} tokens)")
 
 with torch.no_grad():
     outputs = model(**inputs, output_attentions=True, output_hidden_states=True)
 
-L = len(outputs.attentions)    # 30
-H = outputs.attentions[0].shape[1]   # 9
-print(f"Layers={L}  Heads={H}  SeqLen={T}")
+L = len(outputs.attentions)
+H = outputs.attentions[0].shape[1]
 
-# ── 3. AdaptiveAvgPool across (L, H) → A_attn (T, T) ─────────────────────────
+# ── AdaptiveAvgPool (L, H) → A_attn (T, T) ────────────────────────────────────
 attn_stack = torch.stack([outputs.attentions[l][0] for l in range(L)])  # (L,H,T,T)
+pool       = nn.AdaptiveAvgPool2d((1, 1))
+attn_flat  = attn_stack.permute(2, 3, 0, 1).reshape(T * T, L, H)
+A_attn     = pool(attn_flat.unsqueeze(1)).squeeze().reshape(T, T).numpy()
+A_scm      = A_attn.T   # A_scm[i,j] = weight i→j
 
-pool      = nn.AdaptiveAvgPool2d((1, 1))
-attn_flat = attn_stack.permute(2, 3, 0, 1).reshape(T * T, L, H)
-A_attn    = pool(attn_flat.unsqueeze(1)).squeeze().reshape(T, T).numpy()  # (T,T)
-
-# Transpose: A_scm[i,j] = "how much j attends to i" → i is parent of j
-A_scm = A_attn.T   # (T,T): A_scm[i,j] = weight of edge i→j
-
-print(f"\nTop causal edges (A_scm[i,j] > 0.05):")
-for i in range(T):
-    for j in range(T):
-        if i != j and A_scm[i, j] > 0.05:
-            print(f"  {tokens[i]:14s} → {tokens[j]:14s}  (w={A_scm[i,j]:.4f})")
-
-# ── 4. Build NeuralSCM with proper U ──────────────────────────────────────────
-# E_raw: last-layer hidden states, shape (1, T, D)
-E_raw_t      = outputs.hidden_states[-1][0]              # (T, D)
-hidden_np    = E_raw_t.unsqueeze(0).numpy()              # (1, T, D)
-
+# ── Build NeuralSCM ───────────────────────────────────────────────────────────
+E_raw_np   = outputs.hidden_states[-1][0].unsqueeze(0).numpy()  # (1, T, D)
 topo_order = [f"t{i}" for i in range(T)]
-var_names  = topo_order
-
-scm = NeuralSCM.from_embeddings(
-    var_names  = var_names,
-    A          = A_scm,
-    E_raw      = hidden_np,
-    topo_order = topo_order,
+scm        = NeuralSCM.from_embeddings(
+    var_names=topo_order, A=A_scm, E_raw=E_raw_np, topo_order=topo_order
 )
-
-# U[j] = self-attention residual = diagonal weight * E[j]
-# A_attn[j,j] is how much token j attends to itself (pooled across L,H)
+# U from self-attention diagonal
 assert scm._E is not None
-diag_weights = np.diag(A_attn)                     # (T,) self-attention weight
-scm._U = diag_weights[:, None] * scm._E            # (T, D)
+scm._U = np.diag(A_attn)[:, None] * scm._E
 
-print(f"\nSelf-attention diagonal (U scale): {np.round(diag_weights, 3)}")
+# ── Generation helper ─────────────────────────────────────────────────────────
+def generate_from_hidden(
+    h_last: np.ndarray,
+    input_ids: torch.Tensor,
+    max_new: int = 30,
+) -> str:
+    """
+    Replace the last token's hidden state with h_last, then greedily generate.
+    We splice the intervened hidden into the model by using it as the KV cache
+    seed: run one forward pass with the modified last hidden → get next token →
+    append → repeat normally.
+    """
+    h_t   = torch.from_numpy(h_last).float().unsqueeze(0).unsqueeze(0)  # (1,1,D)
+    # Project modified hidden → logits → sample next token
+    logits_first = model.lm_head(h_t).squeeze(0)   # (1, vocab)
+    next_id      = logits_first.argmax(dim=-1)       # (1,)
+    generated    = [next_id.item()]
 
-# ── 5. Baseline next-token prediction from last hidden state ──────────────────
-print("\n== Baseline next-token predictions (from last hidden state) ==")
-E_last_baseline = scm._E[-1]   # (D,) last token hidden state
-baseline_top = hidden_to_top_tokens(E_last_baseline)
-print(f"  Last token: '{tokens[-1]}'")
-print(f"  Top-5 next tokens: {baseline_top}")
+    # Continue generation normally from the full context + first new token
+    cur_ids = torch.cat([input_ids, next_id.unsqueeze(0)], dim=-1)
+    for _ in range(max_new - 1):
+        with torch.no_grad():
+            out     = model(cur_ids)
+            next_id = out.logits[0, -1].argmax().unsqueeze(0)
+        generated.append(next_id.item())
+        cur_ids = torch.cat([cur_ids, next_id.unsqueeze(0)], dim=-1)
+        if next_id.item() in (tokenizer.eos_token_id, tokenizer.pad_token_id):
+            break
 
-# ── 6. do() intervention → logit shift ────────────────────────────────────────
-# Intervene on "economic" (T-2), propagate, observe last-token predictions
-interv_node = f"t{T-2}"   # "economic" (second-to-last)
-target_node = f"t{T-1}"   # last token = "inequality"
+    return tokenizer.decode(generated, skip_special_tokens=True)
 
-print(f"\n== do('{tokens[T-2]}') interventions → next-token prediction shift ==")
+# ── Baseline generation ───────────────────────────────────────────────────────
+print("\n" + "=" * 65)
+print("BASELINE (no intervention)")
+print("=" * 65)
+_, E_base = scm.step({})
+continuation_base = generate_from_hidden(E_base[T-1], inputs["input_ids"])
+print(f"  {PROMPT} ...")
+print(f"  → {continuation_base}")
 
-baseline_state, E_base_next = scm.step({})
-E_last_base = E_base_next[T-1]
-base_preds  = hidden_to_top_tokens(E_last_base)
-print(f"  Baseline  → top-5: {base_preds}")
+# ── Intervene on different tokens, watch generation change ────────────────────
+interventions = {
+    "economic (t7)":    (f"t{T-2}", [2.0, 5.0, 10.0]),
+    "Revolution (t5)":  (f"t5",     [2.0, 5.0, 10.0]),
+    "The (t0)":         (f"t0",     [2.0, 5.0, 10.0]),
+}
 
-for scale in [2.0, 5.0, 10.0]:
-    interv_val = float(np.linalg.norm(scm._E[T-2])) * scale
-    state_int, E_int_next = scm.step({interv_node: interv_val})
-    E_last_int = E_int_next[T-1]
-    int_preds  = hidden_to_top_tokens(E_last_int)
-    delta_norm = state_int[target_node] - baseline_state[target_node]
-    print(f"  do({tokens[T-2]}={scale:.0f}x) → top-5: {int_preds}  Δnorm={delta_norm:+.3f}")
+for label, (node, scales) in interventions.items():
+    tok_idx  = int(node[1:])
+    tok_name = tokens[tok_idx]
+    base_val = float(np.linalg.norm(scm._E[tok_idx]))
+    print(f"\n{'=' * 65}")
+    print(f"INTERVENING ON  '{tok_name}'  (baseline norm = {base_val:.2f})")
+    print(f"{'=' * 65}")
+    for scale in scales:
+        interv_val       = base_val * scale
+        _, E_int         = scm.step({node: interv_val})
+        continuation_int = generate_from_hidden(E_int[T-1], inputs["input_ids"])
+        print(f"  do({tok_name}={scale:.0f}x) → {continuation_int}")
 
-# ── 7. Counterfactual on last token ───────────────────────────────────────────
-print(f"\n== Counterfactual: '{tokens[-1]}' hidden state ==")
-cf_val  = scm.counterfactual({interv_node: float(np.linalg.norm(scm._E[T-2])) * 5.0},
-                              target=target_node)
-base_norm = float(np.linalg.norm(scm._E[T-1]))
-print(f"  baseline norm   = {base_norm:.4f}")
-print(f"  do(economic=5x) = {cf_val:.4f}  (Δ = {cf_val - base_norm:+.4f}  {(cf_val/base_norm-1)*100:+.1f}%)")
+# ── CausalPlanner: find intervention to steer toward a target concept ──────────
+print(f"\n{'=' * 65}")
+print("CAUSALPLANNER: push 'inequality' norm toward 'Revolution' level")
+print(f"{'=' * 65}")
 
-# ── 8. CausalPlanner: steer last-token hidden toward a target embedding ────────
-# Target: the hidden state of "economic" (make "inequality" look like "economic")
-print(f"\n== CausalPlanner: steer '{tokens[-1]}' representation ==")
-
-# Target norm = norm of "economic"'s own hidden state
-economic_norm  = float(np.linalg.norm(scm._E[T-2]))
-target_norm    = economic_norm   # push "inequality" to have same magnitude as "economic"
+# Target: make "inequality" have same representation magnitude as "Revolution"
+rev_norm  = float(np.linalg.norm(scm._E[5]))   # Revolution = t5
+ineq_node = f"t{T-1}"
+econ_node = f"t{T-2}"
 
 planner = CausalPlanner(scm)
 result  = planner.plan(
     E_init       = scm._E,
-    target       = {target_node: target_norm},
-    interv_nodes = [interv_node],
-    lr            = 0.05,
-    steps         = 500,
-    rollout_steps = T,
-    verbose       = True,
+    target       = {ineq_node: rev_norm},
+    interv_nodes = [econ_node, "t0"],
+    lr           = 0.05,
+    steps        = 500,
+    rollout_steps= T,
+    verbose      = True,
 )
-a_opt = result["a_opt"][interv_node]
-print(f"  target norm ({tokens[-1]}) = {target_norm:.4f}")
-print(f"  optimal {tokens[T-2]:12s} = {a_opt:.4f}  (baseline = {economic_norm:.4f})")
-print(f"  final energy           = {result['energy']:.6f}")
+a_opt = result["a_opt"]
+print(f"  target norm ({tokens[T-1]}) = {rev_norm:.4f}")
+print(f"  optimal interventions: { {tokens[int(k[1:])]: f'{v:.3f}' for k, v in a_opt.items()} }")
+print(f"  final energy = {result['energy']:.6f}")
 
-state_opt, E_opt_next = scm.step({interv_node: a_opt})
-E_last_opt  = E_opt_next[T-1]
-opt_preds   = hidden_to_top_tokens(E_last_opt)
-print(f"  achieved '{tokens[-1]}' norm = {state_opt[target_node]:.4f}")
-print(f"  next-token predictions after planning: {opt_preds}")
-
-print(f"\n  Prediction shift summary:")
-print(f"    baseline → {base_preds[0]}")
-print(f"    planned  → {opt_preds[0]}")
+_, E_planned        = scm.step(a_opt)
+continuation_plan   = generate_from_hidden(E_planned[T-1], inputs["input_ids"])
+print(f"\n  Baseline  → {continuation_base}")
+print(f"  Planned   → {continuation_plan}")
 
 print("\nDone.")
