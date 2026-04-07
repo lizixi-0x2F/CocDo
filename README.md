@@ -150,21 +150,46 @@ Joint intervention (x0, x1, x2) — same target, multiple solutions:
 
 ---
 
-### LLM generation steering
+### CausalSearch — causal RAG over a knowledge base
 
 ```bash
-pip install transformers
-python examples/demo_llm_causal.py
+pip install sentence-transformers
+python examples/demo_causal_search.py
 ```
 
-Applies the causal framework directly to a running LLM (SmolLM2-135M-Instruct):
+Indexes a markdown knowledge base (22 chapters, ~1800 paragraphs) and compares two retrieval strategies on the same queries:
 
-1. Pool the full `(L, H, T, T)` attention stack to a `(T, T)` causal adjacency matrix — tokens are causal nodes
-2. Use final-layer hidden states as node embeddings
-3. Run `step({token_node: scale})` to steer representations before generation
-4. Use `CausalPlanner` to find the optimal amplitudes that drive a target token's embedding norm to a reference value
+**Vector search (RAG baseline):** cosine similarity in BGE embedding space.
 
-This reframes LLM generation steering as a causal planning problem: instead of tuning prompts or fine-tuning weights, you intervene on the causal graph of token influences.
+**CausalSearch (Pearl three-step):**
+1. **Abduction** — find the nearest-neighbor paragraph `j*` to the query in BGE space
+2. **Action** — `do(j* = query_emb)`: inject the query vector, zero `j*`'s incoming edges in `A`
+3. **Prediction** — `E_next = A_do^T @ E_do + U`; rank all nodes by `Δ‖E_next‖`
+
+Positive Δ = **downstream activation** (knowledge triggered by the query).
+Negative Δ = **upstream prerequisite** (concepts needed to understand the query).
+
+```
+Query: "What is the relationship between Transformer attention and Bayesian inference"
+
+[Vector Search · RAG baseline]
+   1. 'ch9·Transformer's success has triggered...'  cos=0.763
+   2. 'ch9·Aside: attention as causality...'        cos=0.682
+   ...
+
+[CausalSearch · Pearl three-step]
+  Abduction anchor -> 'ch9·Transformer's success...'  (cos=0.763)
+
+  + Downstream (knowledge chain):
+    + 'ch17·Comparing Bayesian update with ch14...'  delta=+2.69e-02
+    + 'ch20·PAC and Bayes: ch17 left off...'         delta=+2.34e-02
+    ...
+
+  * CausalSearch-only (missed by RAG):
+    ch17 Bayesian inference (x4), ch1 generative model layer, ch19 proof...
+```
+
+CausalSearch consistently surfaces cross-chapter prerequisite/consequence chains that cosine similarity misses — because it follows learned causal edges, not surface similarity.
 
 ---
 
@@ -271,12 +296,12 @@ cocdo/
 │   ├── reduction.py    β-reduction + tensor-aware builtin evaluation
 │   └── typing.py       type checker + intervention guard
 └── model/
-    ├── causal_ffnn.py  CausalFFNN, NodeProjector, acyclicity_loss, topo_order_from_A
+    ├── causal_ffnn.py  CausalFFNN, acyclicity_loss, topo_order_from_A
     ├── scm.py          NeuralSCM — do(), rollout(), counterfactual(), from_embeddings()
     └── planner.py      CausalPlanner — norm-based energy, Adam planning
 examples/
-├── demo_gcastle.py     gCastle synthetic DAG → full pipeline (NOTEARS + auto topo)
-└── demo_llm_causal.py  LLM attention → causal graph → generation steering
+├── demo_gcastle.py        gCastle synthetic DAG → full pipeline (NOTEARS + auto topo)
+└── demo_causal_search.py  BGE + CausalFFNN → Pearl three-step causal RAG vs vector search
 ```
 
 ---
