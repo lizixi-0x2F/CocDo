@@ -55,23 +55,20 @@ scm._U = np.diag(A_attn)[:, None] * scm._E
 
 # ── Generation helper ─────────────────────────────────────────────────────────
 def generate_from_hidden(
-    h_last: np.ndarray,
+    E_next: np.ndarray,
     input_ids: torch.Tensor,
     max_new: int = 30,
 ) -> str:
     """
-    Replace the last token's hidden state with h_last, then greedily generate.
-    We splice the intervened hidden into the model by using it as the KV cache
-    seed: run one forward pass with the modified last hidden → get next token →
-    append → repeat normally.
+    Project E_next[T-1] through lm_head to get the first token logits,
+    then continue normally from the full context.
     """
-    h_t   = torch.from_numpy(h_last).float().unsqueeze(0).unsqueeze(0)  # (1,1,D)
-    # Project modified hidden → logits → sample next token
-    logits_first = model.lm_head(h_t).squeeze(0)   # (1, vocab)
-    next_id      = logits_first.argmax(dim=-1)       # (1,)
-    generated    = [next_id.item()]
+    h_last = torch.from_numpy(E_next[T - 1]).float().unsqueeze(0).unsqueeze(0)  # (1,1,D)
+    with torch.no_grad():
+        logits_first = model.lm_head(h_last).squeeze(0)   # (1, vocab)
+        next_id      = logits_first.argmax(dim=-1)          # (1,)
+    generated = [next_id.item()]
 
-    # Continue generation normally from the full context + first new token
     cur_ids = torch.cat([input_ids, next_id.unsqueeze(0)], dim=-1)
     for _ in range(max_new - 1):
         with torch.no_grad():
@@ -89,7 +86,7 @@ print("\n" + "=" * 65)
 print("BASELINE (no intervention)")
 print("=" * 65)
 _, E_base = scm.step({})
-continuation_base = generate_from_hidden(E_base[T-1], inputs["input_ids"])
+continuation_base = generate_from_hidden(E_base, inputs["input_ids"])
 print(f"  {PROMPT} ...")
 print(f"  → {continuation_base}")
 
@@ -110,7 +107,7 @@ for label, (node, scales) in interventions.items():
     for scale in scales:
         interv_val       = base_val * scale
         _, E_int         = scm.step({node: interv_val})
-        continuation_int = generate_from_hidden(E_int[T-1], inputs["input_ids"])
+        continuation_int = generate_from_hidden(E_int, inputs["input_ids"])
         print(f"  do({tok_name}={scale:.0f}x) → {continuation_int}")
 
 # ── CausalPlanner: find intervention to steer toward a target concept ──────────
@@ -139,7 +136,7 @@ print(f"  optimal interventions: { {tokens[int(k[1:])]: f'{v:.3f}' for k, v in a
 print(f"  final energy = {result['energy']:.6f}")
 
 _, E_planned        = scm.step(a_opt)
-continuation_plan   = generate_from_hidden(E_planned[T-1], inputs["input_ids"])
+continuation_plan   = generate_from_hidden(E_planned, inputs["input_ids"])
 print(f"\n  Baseline  → {continuation_base}")
 print(f"  Planned   → {continuation_plan}")
 
