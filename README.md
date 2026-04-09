@@ -193,6 +193,44 @@ CausalSearch consistently surfaces cross-chapter prerequisite/consequence chains
 
 ---
 
+### Tic-Tac-Toe — CausalPlanner vs MCTS
+
+```bash
+python examples/demo_tictactoe.py
+```
+
+Pits **gradient-based causal planning** against **Monte Carlo Tree Search** on Tic-Tac-Toe:
+
+- **CausalPlanner** — treats move selection as a causal intervention problem. Each of the 9 cells is an SCM node with a 16-dim embedding; edges connect cells that share a winning line. The planner runs Adam gradient descent on the intervention energy — no tree search.
+- **MCTS** — UCB1 selection + random rollouts (default 500). Near-optimal for Tic-Tac-Toe: always takes a winning move if available, always blocks a forced loss.
+
+```bash
+python examples/demo_tictactoe.py --games 50 --rollouts 500
+```
+
+```
+══════════════════════════════════════════════════════════════
+  Tic-Tac-Toe  |  CausalPlanner vs MCTS (500 rollouts/move)
+══════════════════════════════════════════════════════════════
+
+  Matchup A: Planner(X) vs MCTS(O)  — Planner moves first
+    50/50  Planner=50  Draw=0  MCTS=0
+
+  Matchup B: MCTS(X) vs Planner(O)  — MCTS moves first
+    50/50  Planner=7   Draw=31  MCTS=12
+
+  Overall  (100 games, MCTS=500 rollouts/move)
+  CausalPlanner wins :  57 / 100  (57.0%)
+  Draws              :  31 / 100  (31.0%)
+  MCTS wins          :  12 / 100  (12.0%)
+```
+
+When moving first (X), CausalPlanner wins every game — the gradient signal from the SCM aligns cleanly with optimal play from the first move. When moving second (O), it draws or loses more often, as the board state requires multi-step lookahead the gradient planner can't model.
+
+> Complexity: Planner = O(steps · N · D) per move (fast, differentiable) — MCTS = O(rollouts · depth) per move (exact, but discrete).
+
+---
+
 ## API
 
 ### `CausalFFNN`
@@ -301,7 +339,8 @@ cocdo/
     └── planner.py      CausalPlanner — norm-based energy, Adam planning
 examples/
 ├── demo_gcastle.py        gCastle synthetic DAG → full pipeline (NOTEARS + auto topo)
-└── demo_causal_search.py  BGE + CausalFFNN → Pearl three-step causal RAG vs vector search
+├── demo_causal_search.py  BGE + CausalFFNN → Pearl three-step causal RAG vs vector search
+└── demo_tictactoe.py      CausalPlanner vs MCTS on Tic-Tac-Toe
 ```
 
 ---
