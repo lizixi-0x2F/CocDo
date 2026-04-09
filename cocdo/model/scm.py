@@ -349,11 +349,6 @@ class NeuralSCM:
 
         # ── Propagate all nodes at once: E_next = A_do^T @ E_do + U ────────
         E_next = A_do.T @ E_do + self._U   # (N,N)^T @ (N,D) = (N,D)
-        # Layer-norm: rescale each token to the mean norm of the original E,
-        # preventing spectral blow-up when stacking many SCM layers.
-        target_norm = float(np.linalg.norm(self._E, axis=-1).mean())
-        cur_norms = np.linalg.norm(E_next, axis=-1, keepdims=True).clip(min=1e-8)
-        E_next = E_next / cur_norms * target_norm
 
         # Intervened nodes keep their fixed embedding (do severs the equation)
         for var_name, scalar_val in interventions.items():

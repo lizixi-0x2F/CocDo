@@ -294,17 +294,20 @@ Internally: `E = sqrt(mean(E_raw²))` (RMS), `U = E − AᵀE` (exogenous residu
 ```python
 planner = CausalPlanner(scm)
 result  = planner.plan(
-    E_init,          # scm._E
-    target,          # {var_name: desired_scalar_norm}
-    interv_nodes,    # variables to optimise over
+    E_init,              # scm._E
+    target,              # {var_name: desired_scalar_norm}
+    interv_nodes,        # variables to optimise over
     lr=0.05,
     steps=200,
-    rollout_steps=1, # increase for multi-hop paths (X→Y→Z needs 2)
+    rollout_steps=1,     # increase for multi-hop paths (X→Y→Z needs 2)
+    cut_incoming=True,   # False when interv_nodes == target_nodes
 )
 # {"a_opt": {name: value}, "energy": float, "history": [...]}
 ```
 
 Energy: `a* = argmin_a  Σⱼ (‖E_next[j]‖ − target_j)²`
+
+`cut_incoming=True` (default) implements strict do-calculus — incoming edges of intervened nodes are severed. Set `cut_incoming=False` when the intervention nodes and target nodes overlap (e.g. optimising embeddings in-place), so gradient flows through the full `A`.
 
 ---
 

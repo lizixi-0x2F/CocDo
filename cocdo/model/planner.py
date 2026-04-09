@@ -71,22 +71,26 @@ class CausalPlanner:
         a: torch.Tensor,            # (K,) intervention values, requires_grad
         interv_nodes: list[str],
         E_cur: torch.Tensor,        # (N, D) current embedding, no grad
+        cut_incoming: bool = True,
     ) -> torch.Tensor:
         """One differentiable causal propagation step under intervention a.
 
-        Implements do-calculus in embedding space:
-            A_do  = A with intervened columns zeroed
-            E_do  = E_cur with intervened rows set to direction * a[i]
-            E_next = A_do^T @ E_do + U
+        cut_incoming=True  (do-calculus): zero columns of intervened nodes in A.
+            Use when interv_nodes ≠ target_nodes (classic X→Y planning).
+        cut_incoming=False (soft substitution): keep full A.
+            Use when interv_nodes == target_nodes (e.g. DoLM gen embedding search),
+            so that E_next[interv] still depends on a via A.T[interv,:] @ E_do.
 
         Returns E_next (N, D), differentiable w.r.t. a.
         """
         N = E_cur.shape[0]
-        col_mask = self._make_col_mask(interv_nodes, N)      # (N, N), const
-        A_do = self._A * (1.0 - col_mask)                    # (N, N), no grad in a
+        if cut_incoming:
+            col_mask = self._make_col_mask(interv_nodes, N)
+            A_do = self._A * (1.0 - col_mask)
+        else:
+            A_do = self._A
 
-        # Build E_do differentiably: for each intervened node i,
-        # add one_hot[i][:, None] * direction[i] * a[i] to the non-intervened base.
+        # Build E_do differentiably: replace intervened rows with direction * a[i].
         one_hots = torch.zeros(len(interv_nodes), N)
         directions = []
         for i, name in enumerate(interv_nodes):
@@ -109,12 +113,13 @@ class CausalPlanner:
 
     def energy(
         self,
-        a: torch.Tensor,            # (K,) intervention values, requires_grad
+        a: torch.Tensor,
         interv_nodes: list[str],
-        E_init: torch.Tensor,       # (N, D) current state embedding, no grad
+        E_init: torch.Tensor,
         target_idx: list[int],
-        scalar_targets: torch.Tensor,  # (|targets|,) desired scalar norms
+        scalar_targets: torch.Tensor,
         rollout_steps: int = 1,
+        cut_incoming: bool = True,
     ) -> torch.Tensor:
         """Compute inconsistency energy E[predict(s_t, a), s_target].
 
@@ -126,7 +131,7 @@ class CausalPlanner:
         """
         E_cur = E_init
         for _ in range(rollout_steps):
-            E_cur = self._step(a, interv_nodes, E_cur)
+            E_cur = self._step(a, interv_nodes, E_cur, cut_incoming=cut_incoming)
         predicted_norms = E_cur[target_idx].norm(dim=-1)   # (|targets|,)
         return ((predicted_norms - scalar_targets) ** 2).sum()
 
@@ -134,13 +139,14 @@ class CausalPlanner:
 
     def plan(
         self,
-        E_init: np.ndarray,             # (N, D) current state
-        target: dict[str, float],       # {var_name: desired_scalar}
+        E_init: np.ndarray,
+        target: dict[str, float],
         interv_nodes: list[str],
         a_init: Optional[np.ndarray] = None,
         lr: float = 0.05,
         steps: int = 200,
         rollout_steps: int = 1,
+        cut_incoming: bool = True,
         verbose: bool = False,
     ) -> dict:
         """Find optimal causal intervention via gradient descent on the energy.
@@ -179,7 +185,7 @@ class CausalPlanner:
         for step in range(steps):
             opt.zero_grad()
             e = self.energy(a, interv_nodes, E_t, target_idx, scalar_targets,
-                            rollout_steps=rollout_steps)
+                            rollout_steps=rollout_steps, cut_incoming=cut_incoming)
             e.backward()
             opt.step()
             e_val = float(e.detach())
