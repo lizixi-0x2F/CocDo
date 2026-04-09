@@ -34,8 +34,8 @@ def extract_llm_data(text: str):
     """
     返回:
       token_strs : N 个唯一 token 字符串
-      hidden_layers : list[np.ndarray (N, D)]  — 30 层 hidden states
-      attn_layers   : list[np.ndarray (n_heads, N, N)]  — 30 层 attention
+      E_raw      : np.ndarray (N, D)  — token embedding（层 0，固定）
+      attn_layers: list[np.ndarray (n_heads, N, N)]  — 30 层 attention
     """
     print(f"加载模型 {MODEL_ID} ...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
@@ -57,19 +57,17 @@ def extract_llm_data(text: str):
     with torch.no_grad():
         outputs = model(**inputs, output_hidden_states=True, output_attentions=True)
 
-    hidden_layers = [
-        outputs.hidden_states[l + 1][0].cpu().numpy()   # (N, D)
-        for l in range(model.config.num_hidden_layers)
-    ]
+    # 只需要 embedding 层的 hidden states 作为 E（不随层变化）
+    E_raw = outputs.hidden_states[0][0].cpu().numpy()    # (N, D) token embeddings
     attn_layers = [
         outputs.attentions[l][0].cpu().numpy()           # (n_heads, N, N)
         for l in range(model.config.num_hidden_layers)
     ]
 
     print(f"  tokens ({len(token_strs)}): {token_strs}")
-    print(f"  hidden: {len(hidden_layers)} × {hidden_layers[0].shape}")
+    print(f"  E_raw:  {E_raw.shape}")
     print(f"  attn:   {len(attn_layers)} × {attn_layers[0].shape}")
-    return token_strs, hidden_layers, attn_layers
+    return token_strs, E_raw, attn_layers
 
 
 # ── 2. 注意力蒸馏：用 attention 初始化 A，微调使其满足 NOTEARS ────────────────
@@ -98,7 +96,7 @@ class AttentionToA(nn.Module):
 
 def build_layer_scm(
     layer_idx: int,
-    hidden: np.ndarray,        # (N, D)
+    E_raw: np.ndarray,         # (N, D) — token embeddings, shared across layers
     attn: np.ndarray,          # (n_heads, N, N)
     var_names: list[str],
     epochs: int = TRAIN_EPOCHS,
@@ -143,11 +141,10 @@ def build_layer_scm(
         A_np = net(attn_t).numpy()                             # (N, N)
 
     topo = topo_order_from_A(A_np, var_names)
-    E_raw = hidden[np.newaxis]                                 # (1, N, D)
     return NeuralSCM.from_embeddings(
         var_names=var_names,
         A=A_np,
-        E_raw=E_raw,
+        E_raw=E_raw[np.newaxis],   # (1, N, D)
         topo_order=topo,
     )
 
@@ -196,13 +193,13 @@ class SCMStack:
 # ── 4. 主流程 ─────────────────────────────────────────────────────────────────
 
 def main():
-    var_names, hidden_layers, attn_layers = extract_llm_data(DEMO_TEXT)
+    var_names, E_raw, attn_layers = extract_llm_data(DEMO_TEXT)
 
-    print(f"\n为 {len(hidden_layers)} 层各训练 AttentionToA ({TRAIN_EPOCHS} epochs) ...")
+    print(f"\n为 {len(attn_layers)} 层各训练 AttentionToA ({TRAIN_EPOCHS} epochs) ...")
     scms: list[NeuralSCM] = []
-    for l, (hidden, attn) in enumerate(zip(hidden_layers, attn_layers)):
+    for l, attn in enumerate(attn_layers):
         verbose = (l % 10 == 9)
-        scm = build_layer_scm(l, hidden, attn, var_names, verbose=verbose)
+        scm = build_layer_scm(l, E_raw, attn, var_names, verbose=verbose)
         scms.append(scm)
         if (l + 1) % 5 == 0:
             n_edges = sum(len(n.parents) for n in scm.vars.values())
