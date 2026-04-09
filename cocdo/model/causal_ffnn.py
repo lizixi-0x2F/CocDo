@@ -5,18 +5,18 @@ import torch.nn as nn
 
 
 def acyclicity_loss(A: torch.Tensor) -> torch.Tensor:
-    """Spectral acyclicity proxy — O(N) for sparse/low-value A.
+    """NOTEARS acyclicity constraint: h(A) = tr(e^{A∘A}) - n.
 
-    For sigmoid outputs near 0 (sparse graph), A∘A has small entries.
-    tr(e^{A∘A}) ≈ n + tr(A∘A) + tr((A∘A)²)/2 + ...
+    h(A) = 0  iff  A is a DAG (for any sparsity level).
+    Gradient pushes toward DAG structure, not toward the zero matrix.
 
-    We use the first non-trivial term: tr(A∘A) = ||A||_F²
-    This is zero iff A=0 (trivial DAG) and grows with cycle strength.
-    Combined with the reconstruction loss pushing A to explain E,
-    it acts as a soft sparsity+acyclicity prior without matrix_exp overflow.
-
-    For the small-N demos (N<200), falls back to exact matrix_exp.
+    For N < 200 uses exact matrix_exp (affordable).
+    For N >= 200 falls back to the Frobenius proxy ||A||_F².
     """
+    n = A.shape[0]
+    if n < 200:
+        M = torch.matrix_exp(A * A)
+        return M.trace() - n
     return (A * A).sum()
 
 

@@ -82,7 +82,6 @@ class NeuralSCM:
         A: np.ndarray,
         E_raw: np.ndarray,
         topo_order: Optional[list[str]] = None,
-        edge_threshold: float = 1e-4,
     ) -> "NeuralSCM":
         """Standard build path: construct SCM from raw sample embeddings.
 
@@ -90,22 +89,22 @@ class NeuralSCM:
         embedding has a stable non-zero norm — required for CausalPlanner
         to have well-defined intervention directions.
 
+        All non-zero A[i,j] entries become causal edges — NOTEARS already
+        enforces sparsity, so no additional threshold is applied.
+
         Parameters
         ----------
-        var_names     : node names, length N
-        A             : (N, N) causal weight matrix from CausalFFNN
-        E_raw         : (n_samples, N, D) per-sample embeddings
-        topo_order    : node names in topological order (roots first).
-                        If None, inferred automatically from A via Kahn's
-                        algorithm on the thresholded adjacency matrix.
-        edge_threshold: minimum A[i,j] weight to register an edge
+        var_names  : node names, length N
+        A          : (N, N) causal weight matrix from CausalFFNN
+        E_raw      : (n_samples, N, D) per-sample embeddings
+        topo_order : node names in topological order (roots first).
+                     If None, inferred automatically from A via Kahn's
+                     algorithm on the thresholded adjacency matrix.
 
         Returns
         -------
         NeuralSCM with all edges added and matrices set.
         """
-        # RMS embedding: captures the typical magnitude of each node's embedding
-        # without cancellation from zero-mean distributions.
         E = np.sqrt((E_raw ** 2).mean(axis=0))   # (N, D)
         U = E - A.T @ E                           # exogenous residual
 
@@ -121,7 +120,7 @@ class NeuralSCM:
                     pi = var_names.index(p)
                     ci = var_names.index(c)
                     w  = float(A[pi, ci])
-                    if w > edge_threshold:
+                    if w > 1e-8:   # only skip exact numerical zeros
                         scm.add_causal_edge(p, c, weight=w)
 
         return scm
@@ -350,6 +349,11 @@ class NeuralSCM:
 
         # ── Propagate all nodes at once: E_next = A_do^T @ E_do + U ────────
         E_next = A_do.T @ E_do + self._U   # (N,N)^T @ (N,D) = (N,D)
+        # Layer-norm: rescale each token to the mean norm of the original E,
+        # preventing spectral blow-up when stacking many SCM layers.
+        target_norm = float(np.linalg.norm(self._E, axis=-1).mean())
+        cur_norms = np.linalg.norm(E_next, axis=-1, keepdims=True).clip(min=1e-8)
+        E_next = E_next / cur_norms * target_norm
 
         # Intervened nodes keep their fixed embedding (do severs the equation)
         for var_name, scalar_val in interventions.items():
